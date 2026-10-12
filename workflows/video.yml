@@ -1,0 +1,700 @@
+name: Video Processing
+
+on:
+  workflow_dispatch:
+    inputs:
+      intro_url:
+        description: "Intro video URL"
+        required: true
+        type: string
+
+      image_url:
+        description: "Image URL"
+        required: true
+        type: string
+
+      audio_url:
+        description: "Audio URL"
+        required: true
+        type: string
+
+      drive_folder_id:
+        description: "Google Drive folder ID"
+        required: true
+        type: string
+
+      video_name:
+        description: "Video name"
+        required: true
+        type: string
+
+      webhook_url:
+        description: "n8n webhook URL"
+        required: true
+        type: string
+
+      waveform_position:
+        description: "Waveform position 1-8"
+        required: true
+        default: "5"
+        type: string
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+
+    outputs:
+      drive_url: ${{ steps.upload.outputs.drive_url }}
+      video_file_id: ${{ steps.upload.outputs.video_file_id }}
+
+    steps:
+
+      # ============================================================
+      # Install dependencies
+      # ============================================================
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            wget \
+            python3 \
+            python3-pip \
+            file \
+            curl
+
+          python3 -m pip install --break-system-packages requests
+
+      # ============================================================
+      # Install FFmpeg
+      # ============================================================
+      - name: Install FFmpeg
+        shell: bash
+        run: |
+          set -e
+
+          echo "Installing FFmpeg..."
+
+          URL1="https://johnvansickle.com/ffmpeg/releases/ffmpeg-7.0.2-amd64-static.tar.xz"
+
+          if wget -q "$URL1" -O ffmpeg.tar.xz; then
+
+            mkdir -p ffmpeg-static
+
+            tar -xf ffmpeg.tar.xz \
+              --strip-components=1 \
+              -C ffmpeg-static
+
+            sudo cp ffmpeg-static/ffmpeg /usr/local/bin/ffmpeg
+            sudo cp ffmpeg-static/ffprobe /usr/local/bin/ffprobe
+
+          else
+
+            echo "John Van Sickle download failed."
+            echo "Trying BtbN..."
+
+            URL2="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+
+            wget -q "$URL2" -O ffmpeg.tar.xz
+
+            mkdir -p ffmpeg-static
+
+            tar -xf ffmpeg.tar.xz \
+              --strip-components=1 \
+              -C ffmpeg-static
+
+            sudo cp ffmpeg-static/bin/ffmpeg /usr/local/bin/ffmpeg
+            sudo cp ffmpeg-static/bin/ffprobe /usr/local/bin/ffprobe
+
+          fi
+
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "Static FFmpeg installation failed."
+            echo "Trying apt..."
+            sudo apt-get install -y ffmpeg
+          fi
+
+          ffmpeg -version
+          ffprobe -version
+
+      # ============================================================
+      # Download media
+      # ============================================================
+      - name: Download media
+        shell: bash
+        run: |
+          set -e
+
+          echo "Downloading intro..."
+          wget -q --show-progress \
+            "${{ inputs.intro_url }}" \
+            -O intro.mp4
+
+          echo "Downloading image..."
+          wget -q --show-progress \
+            "${{ inputs.image_url }}" \
+            -O image.png
+
+          echo "Downloading audio..."
+          wget -q --show-progress \
+            "${{ inputs.audio_url }}" \
+            -O audio.ogg
+
+          echo "Files:"
+          ls -lh intro.mp4 image.png audio.ogg
+
+          echo "File types:"
+          file intro.mp4
+          file image.png
+          file audio.ogg
+
+      # ============================================================
+      # Analyze media
+      # ============================================================
+      - name: Analyze media
+        shell: bash
+        run: |
+          set -e
+
+          echo "INTRO:"
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -show_entries stream=codec_name,width,height,r_frame_rate \
+            -of default=noprint_wrappers=1 \
+            intro.mp4 || true
+
+          echo ""
+          echo "IMAGE:"
+          ffprobe \
+            -v error \
+            -show_entries stream=codec_name,width,height \
+            -of default=noprint_wrappers=1 \
+            image.png || true
+
+          echo ""
+          echo "AUDIO:"
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -show_entries stream=codec_name,sample_rate,channels \
+            -of default=noprint_wrappers=1 \
+            audio.ogg || true
+
+
+      # ============================================================
+      # Create montage
+      #
+      # The Intro duration is detected automatically using ffprobe.
+      #
+      # Structure:
+      #   [0s ───────── Intro duration - 1s]   Intro
+      #   [Intro duration - 1s ── Intro duration] Fade
+      #   [Intro duration ───────────────]       Image
+      #
+      # No hard-coded Intro duration.
+      # ============================================================
+      - name: Create montage
+        shell: bash
+        run: |
+          set -e
+
+          rm -f montage.mp4
+
+          # ----------------------------------------------------------
+          # Detect the real Intro duration
+          # ----------------------------------------------------------
+          INTRO_DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            intro.mp4)
+
+          echo "Detected Intro duration: ${INTRO_DURATION} seconds"
+
+          # ----------------------------------------------------------
+          # Validate duration
+          # ----------------------------------------------------------
+          if [ -z "$INTRO_DURATION" ]; then
+            echo "ERROR: Could not determine Intro duration."
+            exit 1
+          fi
+
+          if ! awk "BEGIN {exit !($INTRO_DURATION > 1)}"; then
+            echo "ERROR: Intro must be longer than 1 second."
+            exit 1
+          fi
+
+          # ----------------------------------------------------------
+          # Fade duration
+          # ----------------------------------------------------------
+          FADE_DURATION=1
+
+          # Fade starts one second before the Intro ends.
+          FADE_OFFSET=$(awk "BEGIN {printf \"%.6f\", $INTRO_DURATION - $FADE_DURATION}")
+
+          echo "Intro duration : ${INTRO_DURATION} seconds"
+          echo "Fade duration  : ${FADE_DURATION} second"
+          echo "Fade starts at : ${FADE_OFFSET} seconds"
+          echo "Image starts at: ${INTRO_DURATION} seconds"
+
+          # ----------------------------------------------------------
+          # Create Intro + Image montage
+          # ----------------------------------------------------------
+          ffmpeg \
+            -y \
+            -i intro.mp4 \
+            -loop 1 -i image.png \
+            -filter_complex "
+              [0:v]
+              scale=1920:1080:force_original_aspect_ratio=decrease,
+              pad=1920:1080:(ow-iw)/2:(oh-ih)/2,
+              fps=30,
+              format=yuv420p
+              [intro];
+
+              [1:v]
+              scale=1920:1080:force_original_aspect_ratio=decrease,
+              pad=1920:1080:(ow-iw)/2:(oh-ih)/2,
+              fps=30,
+              format=yuv420p
+              [image];
+
+              [intro][image]
+              xfade=
+                transition=fade:
+                duration=${FADE_DURATION}:
+                offset=${FADE_OFFSET}
+              [video]
+            " \
+            -map "[video]" \
+            -an \
+            -c:v libx264 \
+            -preset medium \
+            -crf 18 \
+            -pix_fmt yuv420p \
+            -r 30 \
+            -t "${INTRO_DURATION}" \
+            montage.mp4
+
+          echo ""
+          echo "Montage created."
+
+          echo "Actual montage duration:"
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            montage.mp4
+
+
+      # ============================================================
+      # Add audio
+      #
+      # Extend the final image frame to match audio duration.
+      # ============================================================
+      - name: Add audio
+        shell: bash
+        run: |
+          set -e
+
+          AUDIO_DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            audio.ogg)
+
+          echo "Audio duration: $AUDIO_DURATION"
+
+          VIDEO_DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            montage.mp4)
+
+          echo "Video duration: $VIDEO_DURATION"
+
+          PROCESS_DURATION="$AUDIO_DURATION"
+
+          rm -f montage_audio.mp4
+
+          ffmpeg \
+            -y \
+            -i montage.mp4 \
+            -i audio.ogg \
+            -filter_complex "
+              [0:v]
+              tpad=stop_mode=clone:stop_duration=${PROCESS_DURATION},
+              trim=duration=${PROCESS_DURATION},
+              setpts=PTS-STARTPTS
+              [v]
+            " \
+            -map "[v]" \
+            -map 1:a \
+            -c:v libx264 \
+            -preset medium \
+            -crf 18 \
+            -pix_fmt yuv420p \
+            -r 30 \
+            -c:a aac \
+            -b:a 192k \
+            -shortest \
+            montage_audio.mp4
+
+          echo "Audio montage created."
+
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            montage_audio.mp4
+
+      # ============================================================
+      # Add waveform
+      #
+      # Waveform:
+      #   - BLACK
+      #   - WHITE background
+      #   - Appears after 10 seconds
+      #   - Remains until the end
+      # ============================================================
+      - name: Add waveform
+        shell: bash
+        run: |
+          set -e
+
+          POSITION="${{ inputs.waveform_position }}"
+
+          case "$POSITION" in
+            1)
+              X=1065
+              Y=533
+              W=776
+              H=13
+              ;;
+            2)
+              X=332
+              Y=112
+              W=1256
+              H=13
+              ;;
+            3)
+              X=179
+              Y=654
+              W=1563
+              H=13
+              ;;
+            4)
+              X=90
+              Y=534
+              W=614
+              H=13
+              ;;
+            5)
+              X=309
+              Y=346
+              W=1302
+              H=13
+              ;;
+            6)
+              X=176
+              Y=732
+              W=1569
+              H=13
+              ;;
+            7)
+              X=277
+              Y=230
+              W=1132
+              H=13
+              ;;
+            8)
+              X=444
+              Y=850
+              W=1353
+              H=13
+              ;;
+            *)
+              echo "ERROR: waveform_position must be 1-8."
+              exit 1
+              ;;
+          esac
+
+          PAD_X=18
+          PAD_Y=16
+
+          BOX_X=$((X - PAD_X))
+          BOX_Y=$((Y - PAD_Y))
+          BOX_W=$((W + PAD_X * 2))
+          BOX_H=$((H + PAD_Y * 2))
+
+          PROCESS_DURATION=$(ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            montage_audio.mp4)
+
+          echo "=========================================="
+          echo "Waveform configuration"
+          echo "Position: $POSITION"
+          echo "X: $X"
+          echo "Y: $Y"
+          echo "W: $W"
+          echo "H: $H"
+          echo "Video duration: $PROCESS_DURATION"
+          echo "Waveform appears after: 10 seconds"
+          echo "Waveform color: BLACK"
+          echo "Background color: WHITE"
+          echo "=========================================="
+
+          rm -f output_final.mp4
+
+          ffmpeg \
+            -y \
+            -i montage_audio.mp4 \
+            -filter_complex "
+
+              color=
+                c=black@0.0:
+                s=1920x1080:
+                r=30:
+                d=${PROCESS_DURATION}
+              [transparent];
+
+              [0:a]
+              asetpts=PTS-STARTPTS,
+              showwaves=
+                s=${W}x${H}:
+                mode=cline:
+                rate=30:
+                scale=sqrt:
+                colors=black:
+                draw=full,
+              format=rgba
+              [wave];
+
+              [transparent][wave]
+              overlay=
+                x=${X}:
+                y=${Y}:
+                eof_action=pass:
+                repeatlast=0
+              [wavevideo];
+
+              [0:v]
+              drawbox=
+                x=${BOX_X}:
+                y=${BOX_Y}:
+                w=${BOX_W}:
+                h=${BOX_H}:
+                color=white@0.55:
+                t=fill:
+                enable='gte(t,10)'
+              [base];
+
+              [base][wavevideo]
+              overlay=
+                x=0:
+                y=0:
+                eof_action=pass:
+                repeatlast=0:
+                enable='gte(t,10)'
+              [v];
+
+            " \
+            -map "[v]" \
+            -map 0:a \
+            -c:v libx264 \
+            -preset medium \
+            -crf 18 \
+            -pix_fmt yuv420p \
+            -c:a copy \
+            -t "$PROCESS_DURATION" \
+            -movflags +faststart \
+            output_final.mp4
+
+          echo ""
+          echo "Final video:"
+          ls -lh output_final.mp4
+
+          echo ""
+          echo "Final video duration:"
+
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            output_final.mp4
+
+      # ============================================================
+      # Upload to Google Drive
+      # ============================================================
+      - name: Upload to Google Drive
+        id: upload
+        shell: bash
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
+          VIDEO_NAME: ${{ inputs.video_name }}
+        run: |
+          set -e
+
+          echo "Getting Google access token..."
+
+          TOKEN_RESPONSE=$(curl -s \
+            -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${GOOGLE_CLIENT_ID}" \
+            -d "client_secret=${GOOGLE_CLIENT_SECRET}" \
+            -d "refresh_token=${GOOGLE_REFRESH_TOKEN}" \
+            -d "grant_type=refresh_token" \
+            "https://oauth2.googleapis.com/token")
+
+          ACCESS_TOKEN=$(python3 -c "
+          import json,sys
+          data=json.loads(sys.stdin.read())
+          print(data['access_token'])
+          " <<< "$TOKEN_RESPONSE")
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "ERROR: Could not obtain Google access token."
+            exit 1
+          fi
+
+          echo "Access token obtained."
+
+          # ----------------------------------------------------------
+          # Search existing file with same name
+          # ----------------------------------------------------------
+          QUERY="'${DRIVE_FOLDER_ID}' in parents and name='${VIDEO_NAME}' and trashed=false"
+
+          SEARCH_RESPONSE=$(curl -s \
+            -G \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            --data-urlencode "q=${QUERY}" \
+            --data-urlencode "fields=files(id,name)" \
+            "https://www.googleapis.com/drive/v3/files")
+
+          echo "Existing files:"
+          echo "$SEARCH_RESPONSE"
+
+          OLD_IDS=$(python3 -c "
+          import json,sys
+          data=json.loads(sys.stdin.read())
+          for f in data.get('files', []):
+              print(f['id'])
+          " <<< "$SEARCH_RESPONSE")
+
+          # ----------------------------------------------------------
+          # Delete old files
+          # ----------------------------------------------------------
+          if [ -n "$OLD_IDS" ]; then
+
+            while IFS= read -r OLD_ID; do
+
+              if [ -n "$OLD_ID" ]; then
+
+                echo "Deleting old file: $OLD_ID"
+
+                curl -s \
+                  -X DELETE \
+                  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                  "https://www.googleapis.com/drive/v3/files/${OLD_ID}"
+
+              fi
+
+            done <<< "$OLD_IDS"
+
+          fi
+
+          # ----------------------------------------------------------
+          # Create metadata
+          # ----------------------------------------------------------
+          cat > metadata.json <<EOF
+          {
+            "name": "${VIDEO_NAME}",
+            "parents": ["${DRIVE_FOLDER_ID}"]
+          }
+          EOF
+
+          # ----------------------------------------------------------
+          # Upload
+          # ----------------------------------------------------------
+          echo "Uploading final video..."
+
+          UPLOAD_RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -F "metadata=@metadata.json;type=application/json;charset=UTF-8" \
+            -F "file=@output_final.mp4;type=video/mp4" \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink")
+
+          echo "Upload response:"
+          echo "$UPLOAD_RESPONSE"
+
+          FILE_ID=$(python3 -c "
+          import json,sys
+          data=json.loads(sys.stdin.read())
+          print(data.get('id',''))
+          " <<< "$UPLOAD_RESPONSE")
+
+          if [ -z "$FILE_ID" ]; then
+            echo "ERROR: Google Drive upload failed."
+            exit 1
+          fi
+
+          DRIVE_URL="https://drive.google.com/file/d/${FILE_ID}/view"
+
+          echo "File ID: $FILE_ID"
+          echo "Drive URL: $DRIVE_URL"
+
+          echo "drive_url=$DRIVE_URL" >> "$GITHUB_OUTPUT"
+          echo "video_file_id=$FILE_ID" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # Send callback to n8n
+      # ============================================================
+      - name: Notify n8n
+        shell: bash
+        env:
+          WEBHOOK_URL: ${{ inputs.webhook_url }}
+          VIDEO_NAME: ${{ inputs.video_name }}
+          DRIVE_URL: ${{ steps.upload.outputs.drive_url }}
+          VIDEO_FILE_ID: ${{ steps.upload.outputs.video_file_id }}
+        run: |
+          set -e
+
+          echo "Sending callback to n8n..."
+
+          python3 - <<'PY'
+          import json
+          import os
+          import requests
+
+          payload = {
+              "videoFileId": os.environ["VIDEO_FILE_ID"],
+              "drive_url": os.environ["DRIVE_URL"],
+              "video_name": os.environ["VIDEO_NAME"]
+          }
+
+          url = os.environ["WEBHOOK_URL"]
+
+          print("Callback payload:")
+          print(json.dumps(payload, indent=2))
+
+          response = requests.post(
+              url,
+              json=payload,
+              timeout=60
+          )
+
+          print("n8n response status:", response.status_code)
+          print("n8n response:", response.text)
+
+          response.raise_for_status()
+          PY
